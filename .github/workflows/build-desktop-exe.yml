@@ -207,7 +207,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $outcome = '${{ steps.package.outcome }}'
           $log = Join-Path $env:GITHUB_WORKSPACE 'packaging.log'
-          $directory = 'source/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $directory = 'source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
           $note = ''
 
           if ($outcome -ne 'success') {
@@ -236,7 +236,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $directory = 'source/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $directory = 'source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
           $exe = @(Get-ChildItem -LiteralPath $directory -Filter '*.exe' -File)
           if ($exe.Count -ne 1) {
             throw "expected exactly one installer in $directory, found $($exe.Count)"
@@ -265,7 +265,7 @@ jobs:
         with:
           name: dsh-desktop-win-x64-unsigned-${{ needs.check.outputs.version }}
           path: |
-            source/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
             SHA256SUMS.txt
             packaging.log
           if-no-files-found: error
@@ -333,7 +333,7 @@ jobs:
           if [ '${{ needs.check.outputs.prerelease }}' = 'true' ]; then
             args+=(--prerelease)
           fi
-          args+=("source/.desktop-build/targets/win-x64/unsigned-artifacts/${{ steps.collect.outputs.file }}"
+          args+=("source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/${{ steps.collect.outputs.file }}"
             SHA256SUMS.txt)
 
           gh "${args[@]}"
