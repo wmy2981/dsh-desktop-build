@@ -48,7 +48,7 @@ jobs:
               $value = Get-ItemProperty $key
               Write-Host "$arch installed=$($value.Installed) version=$($value.Version)"
             } else {
-              Write-Host "$arch: 注册表无记录"
+              Write-Host "${arch}: 注册表无记录"
             }
           }
           $dlls = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'concrt140.dll')
