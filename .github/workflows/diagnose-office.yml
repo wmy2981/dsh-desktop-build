@@ -69,6 +69,7 @@ jobs:
             $mp = Get-MpComputerStatus -ErrorAction Stop
             Write-Host "Defender RealTimeProtection=$($mp.RealTimeProtectionEnabled) AntivirusEnabled=$($mp.AntivirusEnabled)"
           } catch { Write-Host "Defender 状态查询失败: $_" }
+          exit 0
 
       - name: Install the kit from npm
         working-directory: probe
@@ -82,6 +83,7 @@ jobs:
           $root = 'node_modules/@deepseek-ai/libreoffice-kit-win32-x64'
           Write-Host "=== $root 顶层 ==="
           Get-ChildItem $root | Select-Object Name | Format-Table -HideTableHeaders | Out-String | Write-Host
+          exit 0
 
       - name: Inspect engine executables
         working-directory: probe
@@ -104,6 +106,7 @@ jobs:
             & $exe.FullName --help 2>&1 | Select-Object -First 12 | Write-Host
             Write-Host "exit=$LASTEXITCODE"
           }
+          exit 0
 
       - name: Create a docx input
         working-directory: probe
@@ -121,6 +124,7 @@ jobs:
           print('input.docx', os.path.getsize('input.docx'), 'bytes')
           '@ | Set-Content -Path make_input.py -Encoding utf8
           python make_input.py
+          exit 0
 
       - name: Convert with the kit Node API
         working-directory: probe
@@ -144,6 +148,7 @@ jobs:
           '@ | Set-Content -Path convert.mjs -Encoding utf8
           node convert.mjs 2>&1 | Write-Host
           if (Test-Path node-api.pdf) { Write-Host "node-api.pdf $((Get-Item node-api.pdf).Length) bytes" } else { Write-Host 'node-api.pdf 未生成' }
+          exit 0
 
       - name: Convert with the kit CLI
         working-directory: probe
@@ -155,6 +160,7 @@ jobs:
           node $cli convert --input input.docx --output cli.pdf 2>&1 | Write-Host
           Write-Host "exit=$LASTEXITCODE"
           if (Test-Path cli.pdf) { Write-Host "cli.pdf $((Get-Item cli.pdf).Length) bytes" } else { Write-Host 'cli.pdf 未生成' }
+          exit 0
 
       - name: Summary
         if: always()
