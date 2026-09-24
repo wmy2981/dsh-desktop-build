@@ -1,0 +1,293 @@
+# 定时拉取官方仓库源码，编译 apps/desktop，产出 Windows NSIS 安装程序，
+# 上传 artifacts 并创建对应的 GitHub Release。
+#
+# 编译完全基于官方源码：使用官方仓库自身的打包脚本与锁定依赖，不修改任何源码文件。
+# 唯一偏离官方发布流程的地方是「不签名」（unsigned），因为本仓库不持有代码签名证书。
+name: Build DeepSeek Harness Windows installer
+
+on:
+  schedule:
+    # 每 2 小时运行一次（UTC）。若该版本已有发行版，会在 1 分钟内跳过。
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '即使该版本已存在发行版，也强制重新编译（会先删除同名旧发行版）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-desktop-exe
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: Build unsigned Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout pipeline repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 1. 取官方最新发行版：版本号 / tag / 提交 / 发行说明
+      # ------------------------------------------------------------------
+      - name: Resolve upstream release
+        id: upstream
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # gh 输出经控制台编码解码，固定为 UTF-8 以免中文发行说明被破坏。
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $OutputEncoding = [Text.Encoding]::UTF8
+
+          $releases = gh release list -R "$env:UPSTREAM_REPOSITORY" --limit 40 `
+            --json tagName,name,isPrerelease,isDraft,createdAt | ConvertFrom-Json
+          $candidates = @($releases | Where-Object { -not $_.isDraft }) |
+            Sort-Object { [datetime]$_.createdAt } -Descending
+          if ($candidates.Count -eq 0) { throw 'no upstream release found' }
+
+          $latest = $candidates[0]
+          $tag = $latest.tagName
+          if ($tag -notmatch '^dsh-v(.+)$') { throw "unexpected upstream tag: $tag" }
+          $version = $Matches[1]
+
+          $commit = (gh api "repos/$env:UPSTREAM_REPOSITORY/commits/$tag" --jq '.sha').Trim()
+          if ($commit -notmatch '^[0-9a-f]{40}$') { throw "cannot resolve commit for $tag" }
+
+          # 版本号必须与官方仓库在该提交处的 package.json 一致，不一致就停下而不是猜。
+          $manifest = gh api "repos/$env:UPSTREAM_REPOSITORY/contents/package.json?ref=$commit" `
+            -H 'Accept: application/vnd.github.raw' | ConvertFrom-Json
+          if ($manifest.version -ne $version) {
+            throw "tag $tag implies $version but package.json declares $($manifest.version)"
+          }
+
+          gh api "repos/$env:UPSTREAM_REPOSITORY/releases/tags/$tag" --jq '.body' |
+            Set-Content -Path upstream-release-notes.md -Encoding utf8
+
+          $title = $latest.name
+          if ([string]::IsNullOrWhiteSpace($title)) { $title = "v$version" }
+          $prerelease = if ($latest.isPrerelease) { 'true' } else { 'false' }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value @(
+            "version=$version",
+            "tag=$tag",
+            "commit=$commit",
+            "title=$title",
+            "prerelease=$prerelease"
+          )
+          Write-Host "upstream release: $title ($tag) at $commit"
+
+      # ------------------------------------------------------------------
+      # 2. 去重：本项目已有同版本发行版则跳过编译与发行
+      # ------------------------------------------------------------------
+      - name: Check for an existing release
+        id: decide
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ steps.upstream.outputs.tag }}'
+          $existing = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>$null
+          $force = '${{ inputs.force }}' -eq 'true'
+
+          if ($existing -and -not $force) {
+            $skip = 'true'
+            $reason = "已存在 $tag 发行版，跳过编译"
+          } else {
+            $skip = 'false'
+            $reason = if ($force) { "强制重建 $tag" } else { "尚无 $tag 发行版，开始编译" }
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value "skip=$skip"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "**$reason**"
+          Write-Host $reason
+
+      # ------------------------------------------------------------------
+      # 3. 克隆官方源码并检出该发行版对应的提交
+      # ------------------------------------------------------------------
+      - name: Clone upstream source at the released commit
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 完整克隆：官方 release 脚本需要读取仓库标签。
+          git clone --quiet "https://github.com/$env:UPSTREAM_REPOSITORY.git" source
+          git -C source checkout --quiet --detach '${{ steps.upstream.outputs.commit }}'
+
+          $head = (git -C source rev-parse HEAD).Trim()
+          if ($head -ne '${{ steps.upstream.outputs.commit }}') { throw "checkout mismatch: $head" }
+          Write-Host "checked out $head"
+
+      # ------------------------------------------------------------------
+      # 4. 写入桌面端打包所需的发布设置
+      #    官方打包脚本只从 apps/desktop/.env.windows 读取这些值（并剥离同名环境变量）。
+      # ------------------------------------------------------------------
+      - name: Write desktop release settings
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 可在仓库 Variables 中覆盖这两项，未设置时使用默认值。
+          $appId = '${{ vars.DSH_DESKTOP_APP_ID }}'
+          if ([string]::IsNullOrWhiteSpace($appId)) { $appId = 'com.deepseek.harness' }
+          $policyOrigin = '${{ vars.DSH_MANDATORY_UPDATE_ORIGIN }}'
+          if ([string]::IsNullOrWhiteSpace($policyOrigin)) { $policyOrigin = 'https://example.com' }
+
+          $settings = @(
+            '# Generated by .github/workflows/build-desktop-exe.yml.',
+            '# Upstream template: apps/desktop/.env.windows.example',
+            "DSH_DESKTOP_APP_ID=$appId",
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production',
+            "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=$policyOrigin"
+          )
+          Set-Content -Path source/apps/desktop/.env.windows -Value $settings -Encoding utf8
+          Get-Content -Path source/apps/desktop/.env.windows | ForEach-Object { Write-Host $_ }
+
+      # ------------------------------------------------------------------
+      # 5. 使用官方仓库声明的工具链版本安装依赖并打包
+      # ------------------------------------------------------------------
+      - uses: pnpm/action-setup@v4
+        if: steps.decide.outputs.skip != 'true'
+        with:
+          package_json_file: source/package.json
+
+      - uses: actions/setup-node@v4
+        if: steps.decide.outputs.skip != 'true'
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        if: steps.decide.outputs.skip != 'true'
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Package Windows installer (unsigned)
+        if: steps.decide.outputs.skip != 'true'
+        working-directory: source
+        env:
+          # 记录构建来源提交，使安装包内的构建元数据可回溯到官方源码。
+          DSH_DESKTOP_BUILD_COMMIT: ${{ steps.upstream.outputs.commit }}
+          DSH_DESKTOP_BUILD_DIRTY: '0'
+        run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64:unsigned
+
+      # ------------------------------------------------------------------
+      # 6. 校验产物并生成校验和
+      # ------------------------------------------------------------------
+      - name: Collect artifacts
+        id: collect
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = 'source/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $exe = @(Get-ChildItem -LiteralPath $directory -Filter '*.exe' -File)
+          if ($exe.Count -ne 1) {
+            throw "expected exactly one installer in $directory, found $($exe.Count)"
+          }
+          $name = $exe[0].Name
+          if ($name -notlike '*unsigned*') { throw "unexpected artifact name: $name" }
+
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe[0].FullName).Hash.ToLower()
+          Set-Content -Path SHA256SUMS.txt -Encoding utf8 -Value "$hash  $name"
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value @(
+            "path=$($exe[0].FullName)",
+            "file=$name",
+            "sha256=$hash"
+          )
+          Write-Host "$name`nsha256: $hash"
+
+          $summary = @(
+            '',
+            '| 上游版本 | 上游提交 | 安装程序 | SHA-256 |',
+            '| --- | --- | --- | --- |',
+            "| ${{ steps.upstream.outputs.version }} | ${{ steps.upstream.outputs.commit }} | $name | $hash |"
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
+
+      - uses: actions/upload-artifact@v4
+        if: steps.decide.outputs.skip != 'true'
+        with:
+          name: dsh-desktop-win-x64-unsigned-${{ steps.upstream.outputs.version }}
+          path: |
+            source/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # ------------------------------------------------------------------
+      # 7. 生成发行说明并创建发行版
+      # ------------------------------------------------------------------
+      - name: Compose release notes
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = @(
+            '> **本发行版由第三方自动化流水线自行编译，非 DeepSeek 官方发布。**',
+            '>',
+            "> 安装程序直接由官方仓库 [deepseek-ai/deepseek-harness](https://github.com/$env:UPSTREAM_REPOSITORY) 的源码编译生成，",
+            '> 未修改任何源码，使用官方仓库自身的打包脚本与锁定依赖。构建产物未进行代码签名。',
+            '',
+            '| 项目 | 值 |',
+            '| --- | --- |',
+            "| 上游版本 | ${{ steps.upstream.outputs.version }} |",
+            "| 上游标签 | ${{ steps.upstream.outputs.tag }} |",
+            "| 上游提交 | ${{ steps.upstream.outputs.commit }} |",
+            '| 目标平台 | Windows x64（NSIS 安装程序） |',
+            "| 安装程序 | ${{ steps.collect.outputs.file }} |",
+            "| SHA-256 | ${{ steps.collect.outputs.sha256 }} |",
+            '| 代码签名 | 无（unsigned 构建） |',
+            '',
+            '> [!WARNING]',
+            '> 该安装程序未签名，Windows SmartScreen 会给出警告；应用内自动更新不可用。',
+            '',
+            '<details>',
+            "<summary>官方原始发行说明（${{ steps.upstream.outputs.tag }}）</summary>",
+            ''
+          )
+          Set-Content -Path release-notes.md -Value $lines -Encoding utf8
+
+          $body = @((Get-Content -Raw -LiteralPath 'upstream-release-notes.md') -split '\r?\n')
+          Add-Content -Path release-notes.md -Value $body -Encoding utf8
+          Add-Content -Path release-notes.md -Encoding utf8 -Value @('', '</details>')
+
+      - name: Create release
+        if: steps.decide.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.upstream.outputs.tag }}'
+
+          # 强制重建时先删除旧发行版及其标签，随后按全新流程创建。
+          if ('${{ inputs.force }}' -eq 'true') {
+            $existing = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>$null
+            if ($existing) { gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag }
+          }
+
+          $arguments = @(
+            'release', 'create', $tag,
+            '--repo', $env:GITHUB_REPOSITORY,
+            '--title', '${{ steps.upstream.outputs.title }}',
+            '--notes-file', 'release-notes.md',
+            '--target', $env:GITHUB_SHA
+          )
+          if ('${{ steps.upstream.outputs.prerelease }}' -eq 'true') { $arguments += '--prerelease' }
+          $arguments += @(
+            'source/.desktop-build/targets/win-x64/unsigned-artifacts/${{ steps.collect.outputs.file }}',
+            'SHA256SUMS.txt'
+          )
+          gh @arguments
