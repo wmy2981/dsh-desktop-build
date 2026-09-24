@@ -97,6 +97,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Actions 会把 $PSNativeCommandUseErrorActionPreference 置为 $true，
+          # 使 gh api 的 404（发行版尚不存在）抛错终止，这里显式关掉。
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = '${{ steps.upstream.outputs.tag }}'
           $existing = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>$null
           $force = '${{ inputs.force }}' -eq 'true'
@@ -270,6 +273,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # 同上：gh api 的 404 属于正常路径，不应终止步骤。
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = '${{ steps.upstream.outputs.tag }}'
 
           # 强制重建时先删除旧发行版及其标签，随后按全新流程创建。
