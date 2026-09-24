@@ -1,0 +1,163 @@
+# 仅手动触发：在 GitHub 托管 runner 上定点诊断 Office 文档转换失败的原因。
+#
+# 这个工作流不参与发行流程，只回答一个问题：同一套预编译 LibreOffice 引擎
+# 在 GitHub 托管 Windows runner 上到底因为什么失败。诊断项：
+#   1. 引擎文档声明的系统前提（MSVC v14 运行库）
+#   2. runner 的代码完整性策略状态（Windows 是否阻止未签名代码）
+#   3. 原生引擎包的文件与可执行文件是否完整
+#   4. 直接运行引擎可执行文件（拿到 LibreOffice 自己的报错文本）
+#   5. 通过 kit 的 Node API 与 CLI 各做一次 docx→PDF 转换
+name: Diagnose Office conversion
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe the native LibreOffice engine
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Create the probe directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path probe | Out-Null
+
+      - name: Report environment prerequisites
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host '=== OS ==='
+          (Get-CimInstance Win32_OperatingSystem).Caption
+          Write-Host "TEMP=$env:TEMP USERPROFILE=$env:USERPROFILE"
+          Write-Host "free disk (C:): $([math]::Round((Get-PSDrive C).Free / 1GB, 1)) GiB"
+
+          Write-Host '=== MSVC v14 Redistributable (kit 声明的系统前提) ==='
+          foreach ($arch in 'x64', 'x86') {
+            $key = "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\$arch"
+            if (Test-Path $key) {
+              $value = Get-ItemProperty $key
+              Write-Host "$arch installed=$($value.Installed) version=$($value.Version)"
+            } else {
+              Write-Host "$arch: 注册表无记录"
+            }
+          }
+          $dlls = @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'concrt140.dll')
+          foreach ($dll in $dlls) {
+            $path = Join-Path $env:WINDIR "System32\$dll"
+            if (Test-Path $path) { Write-Host "$dll present ($((Get-Item $path).Length) bytes)" }
+            else { Write-Host "$dll MISSING" }
+          }
+
+          Write-Host '=== 代码完整性策略（未签名代码是否被阻止）==='
+          try {
+            $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop
+            Write-Host "CodeIntegrityPolicyEnforcementStatus=$($dg.CodeIntegrityPolicyEnforcementStatus)"
+            Write-Host "SecurityServicesConfigured=$($dg.SecurityServicesConfigured -join ',')"
+            Write-Host "UsermodeCodeIntegrityPolicyEnforcementStatus=$($dg.UsermodeCodeIntegrityPolicyEnforcementStatus)"
+          } catch { Write-Host "DeviceGuard 查询失败: $_" }
+          try {
+            $mp = Get-MpComputerStatus -ErrorAction Stop
+            Write-Host "Defender RealTimeProtection=$($mp.RealTimeProtectionEnabled) AntivirusEnabled=$($mp.AntivirusEnabled)"
+          } catch { Write-Host "Defender 状态查询失败: $_" }
+
+      - name: Install the kit from npm
+        working-directory: probe
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          npm init -y | Out-Null
+          npm install '@deepseek-ai/libreoffice-kit@0.1.1' 2>&1 | Select-Object -Last 8 | Write-Host
+          Write-Host '=== 已安装的原生引擎包 ==='
+          Get-ChildItem 'node_modules/@deepseek-ai' | Select-Object Name | Format-Table -HideTableHeaders | Out-String | Write-Host
+          $root = 'node_modules/@deepseek-ai/libreoffice-kit-win32-x64'
+          Write-Host "=== $root 顶层 ==="
+          Get-ChildItem $root | Select-Object Name | Format-Table -HideTableHeaders | Out-String | Write-Host
+
+      - name: Inspect engine executables
+        working-directory: probe
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ErrorActionPreference = 'Continue'
+          $root = 'node_modules/@deepseek-ai/libreoffice-kit-win32-x64'
+
+          Write-Host '=== manifest ==='
+          Get-Content (Join-Path $root 'package.json') -Raw | Write-Host
+
+          $exes = Get-ChildItem $root -Recurse -Include '*.exe' -ErrorAction SilentlyContinue
+          Write-Host "=== exe 清单（共 $($exes.Count) 个）==="
+          $exes | ForEach-Object { Write-Host "  $($_.FullName.Substring($root.Length + 1))  $([math]::Round($_.Length/1KB,0)) KiB" }
+
+          Write-Host '=== 逐个 --help/--version（拿引擎自己的报错）==='
+          foreach ($exe in $exes | Select-Object -First 6) {
+            Write-Host "--- $($exe.Name) --help ---"
+            & $exe.FullName --help 2>&1 | Select-Object -First 12 | Write-Host
+            Write-Host "exit=$LASTEXITCODE"
+          }
+
+      - name: Create a docx input
+        working-directory: probe
+        shell: pwsh
+        run: |
+          @'
+          import os, zipfile
+          content_types = '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'
+          rels = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'
+          document = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>conversion probe</w:t></w:r></w:p></w:body></w:document>'
+          with zipfile.ZipFile('input.docx', 'w', zipfile.ZIP_DEFLATED) as archive:
+              archive.writestr('[Content_Types].xml', content_types)
+              archive.writestr('_rels/.rels', rels)
+              archive.writestr('word/document.xml', document)
+          print('input.docx', os.path.getsize('input.docx'), 'bytes')
+          '@ | Set-Content -Path make_input.py -Encoding utf8
+          python make_input.py
+
+      - name: Convert with the kit Node API
+        working-directory: probe
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          @'
+          import { resolve } from 'node:path'
+          import { createConverter } from '@deepseek-ai/libreoffice-kit'
+          const started = Date.now()
+          let converter
+          try {
+            converter = await createConverter({ timeoutMs: 120000 })
+            const result = await converter.render({ inputPath: resolve('input.docx'), outputPath: resolve('node-api.pdf') })
+            console.log('NODE_API_OK ' + JSON.stringify({ backend: result.backend, missingFonts: result.missingFonts, ms: Date.now() - started }))
+          } catch (error) {
+            console.log('NODE_API_FAIL ' + JSON.stringify({ name: error?.name, code: error?.code, message: error?.message, cause: error?.cause?.message, causeCode: error?.cause?.code }))
+          } finally {
+            try { await converter?.dispose?.() } catch {}
+          }
+          '@ | Set-Content -Path convert.mjs -Encoding utf8
+          node convert.mjs 2>&1 | Write-Host
+          if (Test-Path node-api.pdf) { Write-Host "node-api.pdf $((Get-Item node-api.pdf).Length) bytes" } else { Write-Host 'node-api.pdf 未生成' }
+
+      - name: Convert with the kit CLI
+        working-directory: probe
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $cli = 'node_modules/@deepseek-ai/libreoffice-kit/lib/cli.js'
+          Write-Host '=== CLI convert（完整 stderr）==='
+          node $cli convert --input input.docx --output cli.pdf 2>&1 | Write-Host
+          Write-Host "exit=$LASTEXITCODE"
+          if (Test-Path cli.pdf) { Write-Host "cli.pdf $((Get-Item cli.pdf).Length) bytes" } else { Write-Host 'cli.pdf 未生成' }
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host '诊断完成：把上面各步骤的输出按顺序看一遍即可定位引擎失败点。'
