@@ -276,6 +276,8 @@ jobs:
       # ------------------------------------------------------------------
       - name: Compose release notes
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           # gh 输出经控制台编码解码，固定为 UTF-8 以免中文发行说明被破坏。
@@ -315,6 +317,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Git Bash 会把形似路径的参数改写成 Windows 路径，这里关掉以免影响 gh 的参数。
+          MSYS_NO_PATHCONV: '1'
         run: |
           set -euo pipefail
           tag='${{ needs.check.outputs.tag }}'
