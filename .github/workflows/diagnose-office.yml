@@ -223,6 +223,23 @@ jobs:
           Write-Host "deep 包内最长文件路径 = $($longest.FullName.Length) 字符"
           Invoke-EngineHelper 'B: 207 字符深路径 + 同一份引擎' (Join-Path $deepPackage 'bin/libreoffice-kit.exe') (Join-Path $deepPackage $relativeProgram)
           Remove-Item -Recurse -Force (Split-Path (Split-Path $deepPackage)) -ErrorAction SilentlyContinue
+
+          # C: 在同样的深路径下改用 kit 的 Node API 转换，对照打包后应用看到的错误文本。
+          $tail = 'app.asar.unpacked/dsh/probe'
+          $prefix = Join-Path $env:TEMP 'deep2'
+          $padLength = 153 - $prefix.Length - 1 - $tail.Length
+          $probeDeep = Join-Path (Join-Path $prefix ('q' * $padLength)) $tail
+          New-Item -ItemType Directory -Force -Path (Split-Path $probeDeep) | Out-Null
+          Copy-Item -Recurse -Force (Get-Location).Path $probeDeep
+          $inside = Join-Path $probeDeep 'node_modules/@deepseek-ai/libreoffice-kit-win32-x64'
+          Write-Host "C: kit 包根长度 = $($inside.Length)"
+          # kit 不会覆盖已存在的输出，先清掉复制过来的旧 PDF。
+          Remove-Item -Force (Join-Path $probeDeep 'node-api.pdf') -ErrorAction SilentlyContinue
+          Push-Location $probeDeep
+          Write-Host '--- C: kit Node API（深路径）---'
+          node convert.mjs 2>&1 | Write-Host
+          Write-Host "exit=$LASTEXITCODE  pdf produced=$(Test-Path 'node-api.pdf')"
+          Pop-Location
           exit 0
 
       - name: Summary
