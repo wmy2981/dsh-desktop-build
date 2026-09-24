@@ -7,12 +7,13 @@ name: Build DeepSeek Harness Windows installer
 
 on:
   schedule:
-    # 每 2 小时运行一次（UTC）。若该版本已有发行版，会在 1 分钟内跳过。
+    # 每 2 小时运行一次（UTC）。没有要构建的新版本时，check job 在 Ubuntu 上快速结束，
+    # build job 显示为 skipped。
     - cron: '0 */2 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: '即使该版本已存在发行版，也强制重新编译（会先删除同名旧发行版）'
+        description: '强制重建最新的上游发行版（会先删除同名旧发行版）'
         type: boolean
         default: false
 
@@ -28,8 +29,95 @@ env:
   DSH_TELEMETRY_DISABLED: '1'
 
 jobs:
+  # 判定交付物：在上游发行版中选出「上游已有、本仓库还没有」的最新一个。
+  check:
+    name: Find an upstream release to build
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.select.outputs.skip }}
+      version: ${{ steps.select.outputs.version }}
+      tag: ${{ steps.select.outputs.tag }}
+      commit: ${{ steps.select.outputs.commit }}
+      title: ${{ steps.select.outputs.title }}
+      prerelease: ${{ steps.select.outputs.prerelease }}
+    steps:
+      - name: Select the newest upstream release this repository lacks
+        id: select
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 上游最近 40 个发行版（含预发布，排除草稿），按创建时间倒序。
+          upstream=$(gh release list -R "$UPSTREAM_REPOSITORY" --limit 40 \
+            --json tagName,name,isPrerelease,isDraft,createdAt |
+            jq -c '[.[] | select(.isDraft | not)] | sort_by(.createdAt) | reverse')
+          # 本仓库已有的发行版标签。上游与本仓库使用同一套标签命名（dsh-v<版本>）。
+          mine=$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName |
+            jq -c '[.[].tagName]')
+
+          if [ '${{ inputs.force }}' = 'true' ]; then
+            # 强制模式：忽略本项目已有发行版，直接取上游最新一个。
+            chosen=$(jq -c 'first // empty' <<<"$upstream")
+          else
+            chosen=$(jq -c --argjson mine "$mine" \
+              'map(select(.tagName as $t | ($mine | index($t)) == null)) | first // empty' <<<"$upstream")
+          fi
+
+          if [ -z "$chosen" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "上游没有本仓库尚未构建的发行版，跳过本次构建。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          tag=$(jq -r '.tagName' <<<"$chosen")
+          name=$(jq -r '.name // ""' <<<"$chosen")
+          prerelease=$(jq -r '.isPrerelease' <<<"$chosen")
+
+          if [[ ! "$tag" =~ ^dsh-v(.+)$ ]]; then
+            echo "::error::unexpected upstream tag: $tag"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+
+          commit=$(gh api "repos/$UPSTREAM_REPOSITORY/commits/$tag" --jq .sha)
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::cannot resolve commit for $tag"
+            exit 1
+          fi
+
+          # 版本号必须与上游在该提交处的 package.json 一致，不一致就停下而不是猜。
+          declared=$(gh api "repos/$UPSTREAM_REPOSITORY/contents/package.json?ref=$commit" \
+            -H 'Accept: application/vnd.github.raw' | jq -r .version)
+          if [ "$declared" != "$version" ]; then
+            echo "::error::tag $tag implies $version but package.json declares $declared"
+            exit 1
+          fi
+
+          [ -n "$name" ] || name="v$version"
+
+          {
+            echo "skip=false"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "title=$name"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "选定上游发行版：**$name**（\`$tag\`）"
+            echo ""
+            echo "| 上游版本 | 上游提交 | 预发布 |"
+            echo "| --- | --- | --- |"
+            echo "| $version | $commit | $prerelease |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: Build unsigned Windows installer
+    needs: check
+    # 没有新版本时整个构建 job 显示为 skipped，工作流不会因此失败。
+    if: needs.check.outputs.skip != 'true'
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -38,105 +126,25 @@ jobs:
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # 1. 取官方最新发行版：版本号 / tag / 提交 / 发行说明
-      # ------------------------------------------------------------------
-      - name: Resolve upstream release
-        id: upstream
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # gh 输出经控制台编码解码，固定为 UTF-8 以免中文发行说明被破坏。
-          [Console]::OutputEncoding = [Text.Encoding]::UTF8
-          $OutputEncoding = [Text.Encoding]::UTF8
-
-          $releases = gh release list -R "$env:UPSTREAM_REPOSITORY" --limit 40 `
-            --json tagName,name,isPrerelease,isDraft,createdAt | ConvertFrom-Json
-          $candidates = @($releases | Where-Object { -not $_.isDraft }) |
-            Sort-Object { [datetime]$_.createdAt } -Descending
-          if ($candidates.Count -eq 0) { throw 'no upstream release found' }
-
-          $latest = $candidates[0]
-          $tag = $latest.tagName
-          if ($tag -notmatch '^dsh-v(.+)$') { throw "unexpected upstream tag: $tag" }
-          $version = $Matches[1]
-
-          $commit = (gh api "repos/$env:UPSTREAM_REPOSITORY/commits/$tag" --jq '.sha').Trim()
-          if ($commit -notmatch '^[0-9a-f]{40}$') { throw "cannot resolve commit for $tag" }
-
-          # 版本号必须与官方仓库在该提交处的 package.json 一致，不一致就停下而不是猜。
-          $manifest = gh api "repos/$env:UPSTREAM_REPOSITORY/contents/package.json?ref=$commit" `
-            -H 'Accept: application/vnd.github.raw' | ConvertFrom-Json
-          if ($manifest.version -ne $version) {
-            throw "tag $tag implies $version but package.json declares $($manifest.version)"
-          }
-
-          gh api "repos/$env:UPSTREAM_REPOSITORY/releases/tags/$tag" --jq '.body' |
-            Set-Content -Path upstream-release-notes.md -Encoding utf8
-
-          $title = $latest.name
-          if ([string]::IsNullOrWhiteSpace($title)) { $title = "v$version" }
-          $prerelease = if ($latest.isPrerelease) { 'true' } else { 'false' }
-
-          Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value @(
-            "version=$version",
-            "tag=$tag",
-            "commit=$commit",
-            "title=$title",
-            "prerelease=$prerelease"
-          )
-          Write-Host "upstream release: $title ($tag) at $commit"
-
-      # ------------------------------------------------------------------
-      # 2. 去重：本项目已有同版本发行版则跳过编译与发行
-      # ------------------------------------------------------------------
-      - name: Check for an existing release
-        id: decide
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Actions 会把 $PSNativeCommandUseErrorActionPreference 置为 $true，
-          # 使 gh api 的 404（发行版尚不存在）抛错终止，这里显式关掉。
-          $PSNativeCommandUseErrorActionPreference = $false
-          $tag = '${{ steps.upstream.outputs.tag }}'
-          $existing = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>$null
-          $force = '${{ inputs.force }}' -eq 'true'
-
-          if ($existing -and -not $force) {
-            $skip = 'true'
-            $reason = "已存在 $tag 发行版，跳过编译"
-          } else {
-            $skip = 'false'
-            $reason = if ($force) { "强制重建 $tag" } else { "尚无 $tag 发行版，开始编译" }
-          }
-          Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value "skip=$skip"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "**$reason**"
-          Write-Host $reason
-
-      # ------------------------------------------------------------------
-      # 3. 克隆官方源码并检出该发行版对应的提交
+      # 1. 克隆官方源码并检出该发行版对应的提交
       # ------------------------------------------------------------------
       - name: Clone upstream source at the released commit
-        if: steps.decide.outputs.skip != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           # 完整克隆：官方 release 脚本需要读取仓库标签。
           git clone --quiet "https://github.com/$env:UPSTREAM_REPOSITORY.git" source
-          git -C source checkout --quiet --detach '${{ steps.upstream.outputs.commit }}'
+          git -C source checkout --quiet --detach '${{ needs.check.outputs.commit }}'
 
           $head = (git -C source rev-parse HEAD).Trim()
-          if ($head -ne '${{ steps.upstream.outputs.commit }}') { throw "checkout mismatch: $head" }
+          if ($head -ne '${{ needs.check.outputs.commit }}') { throw "checkout mismatch: $head" }
           Write-Host "checked out $head"
 
       # ------------------------------------------------------------------
-      # 4. 写入桌面端打包所需的发布设置
+      # 2. 写入桌面端打包所需的发布设置
       #    官方打包脚本只从 apps/desktop/.env.windows 读取这些值（并剥离同名环境变量）。
       # ------------------------------------------------------------------
       - name: Write desktop release settings
-        if: steps.decide.outputs.skip != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -158,38 +166,33 @@ jobs:
           Get-Content -Path source/apps/desktop/.env.windows | ForEach-Object { Write-Host $_ }
 
       # ------------------------------------------------------------------
-      # 5. 使用官方仓库声明的工具链版本安装依赖并打包
+      # 3. 使用官方仓库声明的工具链版本安装依赖并打包
       # ------------------------------------------------------------------
       - uses: pnpm/action-setup@v4
-        if: steps.decide.outputs.skip != 'true'
         with:
           package_json_file: source/package.json
 
       - uses: actions/setup-node@v4
-        if: steps.decide.outputs.skip != 'true'
         with:
           node-version: 24
 
       - name: Install dependencies
-        if: steps.decide.outputs.skip != 'true'
         working-directory: source
         run: pnpm install --frozen-lockfile
 
       - name: Package Windows installer (unsigned)
-        if: steps.decide.outputs.skip != 'true'
         working-directory: source
         env:
           # 记录构建来源提交，使安装包内的构建元数据可回溯到官方源码。
-          DSH_DESKTOP_BUILD_COMMIT: ${{ steps.upstream.outputs.commit }}
+          DSH_DESKTOP_BUILD_COMMIT: ${{ needs.check.outputs.commit }}
           DSH_DESKTOP_BUILD_DIRTY: '0'
         run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64:unsigned
 
       # ------------------------------------------------------------------
-      # 6. 校验产物并生成校验和
+      # 4. 校验产物并生成校验和
       # ------------------------------------------------------------------
       - name: Collect artifacts
         id: collect
-        if: steps.decide.outputs.skip != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -205,7 +208,6 @@ jobs:
           Set-Content -Path SHA256SUMS.txt -Encoding utf8 -Value "$hash  $name"
 
           Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value @(
-            "path=$($exe[0].FullName)",
             "file=$name",
             "sha256=$hash"
           )
@@ -215,14 +217,13 @@ jobs:
             '',
             '| 上游版本 | 上游提交 | 安装程序 | SHA-256 |',
             '| --- | --- | --- | --- |',
-            "| ${{ steps.upstream.outputs.version }} | ${{ steps.upstream.outputs.commit }} | $name | $hash |"
+            "| ${{ needs.check.outputs.version }} | ${{ needs.check.outputs.commit }} | $name | $hash |"
           )
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value $summary
 
       - uses: actions/upload-artifact@v4
-        if: steps.decide.outputs.skip != 'true'
         with:
-          name: dsh-desktop-win-x64-unsigned-${{ steps.upstream.outputs.version }}
+          name: dsh-desktop-win-x64-unsigned-${{ needs.check.outputs.version }}
           path: |
             source/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
             SHA256SUMS.txt
@@ -230,13 +231,16 @@ jobs:
           retention-days: 30
 
       # ------------------------------------------------------------------
-      # 7. 生成发行说明并创建发行版
+      # 5. 生成发行说明并创建发行版
       # ------------------------------------------------------------------
       - name: Compose release notes
-        if: steps.decide.outputs.skip != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # gh 输出经控制台编码解码，固定为 UTF-8 以免中文发行说明被破坏。
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $OutputEncoding = [Text.Encoding]::UTF8
+
           $lines = @(
             '> **本发行版由第三方自动化流水线自行编译，非 DeepSeek 官方发布。**',
             '>',
@@ -245,9 +249,9 @@ jobs:
             '',
             '| 项目 | 值 |',
             '| --- | --- |',
-            "| 上游版本 | ${{ steps.upstream.outputs.version }} |",
-            "| 上游标签 | ${{ steps.upstream.outputs.tag }} |",
-            "| 上游提交 | ${{ steps.upstream.outputs.commit }} |",
+            "| 上游版本 | ${{ needs.check.outputs.version }} |",
+            "| 上游标签 | ${{ needs.check.outputs.tag }} |",
+            "| 上游提交 | ${{ needs.check.outputs.commit }} |",
             '| 目标平台 | Windows x64（NSIS 安装程序） |',
             "| 安装程序 | ${{ steps.collect.outputs.file }} |",
             "| SHA-256 | ${{ steps.collect.outputs.sha256 }} |",
@@ -257,42 +261,38 @@ jobs:
             '> 该安装程序未签名，Windows SmartScreen 会给出警告；应用内自动更新不可用。',
             '',
             '<details>',
-            "<summary>官方原始发行说明（${{ steps.upstream.outputs.tag }}）</summary>",
+            "<summary>官方原始发行说明（${{ needs.check.outputs.tag }}）</summary>",
             ''
           )
           Set-Content -Path release-notes.md -Value $lines -Encoding utf8
 
-          $body = @((Get-Content -Raw -LiteralPath 'upstream-release-notes.md') -split '\r?\n')
-          Add-Content -Path release-notes.md -Value $body -Encoding utf8
+          $official = @(gh api "repos/$env:UPSTREAM_REPOSITORY/releases/tags/${{ needs.check.outputs.tag }}" --jq '.body')
+          Add-Content -Path release-notes.md -Value $official -Encoding utf8
           Add-Content -Path release-notes.md -Encoding utf8 -Value @('', '</details>')
 
       - name: Create release
-        if: steps.decide.outputs.skip != 'true'
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          # 同上：gh api 的 404 属于正常路径，不应终止步骤。
-          $PSNativeCommandUseErrorActionPreference = $false
-          $tag = '${{ steps.upstream.outputs.tag }}'
+          set -euo pipefail
+          tag='${{ needs.check.outputs.tag }}'
 
           # 强制重建时先删除旧发行版及其标签，随后按全新流程创建。
-          if ('${{ inputs.force }}' -eq 'true') {
-            $existing = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>$null
-            if ($existing) { gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag }
-          }
+          if [ '${{ inputs.force }}' = 'true' ] &&
+             gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
 
-          $arguments = @(
-            'release', 'create', $tag,
-            '--repo', $env:GITHUB_REPOSITORY,
-            '--title', '${{ steps.upstream.outputs.title }}',
-            '--notes-file', 'release-notes.md',
-            '--target', $env:GITHUB_SHA
-          )
-          if ('${{ steps.upstream.outputs.prerelease }}' -eq 'true') { $arguments += '--prerelease' }
-          $arguments += @(
-            'source/.desktop-build/targets/win-x64/unsigned-artifacts/${{ steps.collect.outputs.file }}',
-            'SHA256SUMS.txt'
-          )
-          gh @arguments
+          args=(release create "$tag"
+            --repo "$GITHUB_REPOSITORY"
+            --title '${{ needs.check.outputs.title }}'
+            --notes-file release-notes.md
+            --target "$GITHUB_SHA")
+          if [ '${{ needs.check.outputs.prerelease }}' = 'true' ]; then
+            args+=(--prerelease)
+          fi
+          args+=("source/.desktop-build/targets/win-x64/unsigned-artifacts/${{ steps.collect.outputs.file }}"
+            SHA256SUMS.txt)
+
+          gh "${args[@]}"
