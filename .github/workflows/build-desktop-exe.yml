@@ -52,27 +52,28 @@ jobs:
           upstream=$(gh release list -R "$UPSTREAM_REPOSITORY" --limit 40 \
             --json tagName,name,isPrerelease,isDraft,createdAt |
             jq -c '[.[] | select(.isDraft | not)] | sort_by(.createdAt) | reverse')
-          # 本仓库已有的发行版标签。上游与本仓库使用同一套标签命名（dsh-v<版本>）。
-          mine=$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName |
-            jq -c '[.[].tagName]')
 
-          if [ '${{ inputs.force }}' = 'true' ]; then
-            # 强制模式：忽略本项目已有发行版，直接取上游最新一个。
-            chosen=$(jq -c 'first // empty' <<<"$upstream")
-          else
-            chosen=$(jq -c --argjson mine "$mine" \
-              'map(select(.tagName as $t | ($mine | index($t)) == null)) | first // empty' <<<"$upstream")
-          fi
-
+          # 只看上游最新一个发行版。
+          chosen=$(jq -c 'first // empty' <<<"$upstream")
           if [ -z "$chosen" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "上游没有本仓库尚未构建的发行版，跳过本次构建。" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "::error::upstream has no release"
+            exit 1
           fi
 
           tag=$(jq -r '.tagName' <<<"$chosen")
           name=$(jq -r '.name // ""' <<<"$chosen")
           prerelease=$(jq -r '.isPrerelease' <<<"$chosen")
+
+          # 判定：上游有该发行版、而本仓库没有，才需要构建；已有同版本（同标签）发行版则跳过。
+          if [ '${{ inputs.force }}' != 'true' ]; then
+            mine=$(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName |
+              jq -c '[.[].tagName]')
+            if jq -e --arg tag "$tag" 'index($tag) != null' <<<"$mine" >/dev/null; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "本项目已有 $tag 发行版，跳过本次构建。" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
 
           if [[ ! "$tag" =~ ^dsh-v(.+)$ ]]; then
             echo "::error::unexpected upstream tag: $tag"
