@@ -3,6 +3,15 @@
 #
 # 编译完全基于官方源码：使用官方仓库自身的打包脚本与锁定依赖，不修改任何源码文件。
 # 唯一偏离官方发布流程的地方是「不签名」（unsigned），因为本仓库不持有代码签名证书。
+#
+# 上游源码必须克隆到短路径（见 SOURCE_DIR），留在默认工作目录下会编译失败：
+# Windows 的路径长度上限是 260 字符，而打包后的应用树还会在这个根目录下再追加 245 字符
+#   · 160 字符：apps\desktop\.desktop-build\targets\win-x64\unsigned-artifacts\win-unpacked\
+#     resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64
+#   · 84 字符：该包 program 目录内最深的文件
+#   · 1 字符：分隔符
+# 所以源码根必须短于 15 字符。路径越界时 LibreOffice 引擎打不开自己的 program 目录，
+# 打包末尾的 Office 文档转换冒烟检查会随之失败。
 name: Build DeepSeek Harness Windows installer
 
 on:
@@ -27,6 +36,10 @@ concurrency:
 env:
   UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
   DSH_TELEMETRY_DISABLED: '1'
+  # 官方源码的克隆位置。必须短：打包后的应用树会在此根目录下再追加 245 字符（见顶部说明），
+  # 这里取 6 字符，最长路径落在 251 字符，余量 9。用正斜杠：Windows 各工具与上传产物的
+  # glob 都接受，可避免混杂分隔符被当成转义。
+  SOURCE_DIR: 'D:/a/s'
 
 jobs:
   # 判定交付物：在上游发行版中选出「上游已有、本仓库还没有」的最新一个。
@@ -128,18 +141,26 @@ jobs:
 
       # ------------------------------------------------------------------
       # 1. 克隆官方源码并检出该发行版对应的提交
+      #    源码放在短路径 SOURCE_DIR：路径过深会让打包末尾的 Office 冒烟检查失败。
       # ------------------------------------------------------------------
+      - name: Prepare the build directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:SOURCE_DIR | Out-Null
+          Write-Host "build directory: $env:SOURCE_DIR（$($env:SOURCE_DIR.Length) 字符）"
+
       - name: Clone upstream source at the released commit
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           # 完整克隆：官方 release 脚本需要读取仓库标签。
-          git clone --quiet "https://github.com/$env:UPSTREAM_REPOSITORY.git" source
-          git -C source checkout --quiet --detach '${{ needs.check.outputs.commit }}'
+          git clone --quiet "https://github.com/$env:UPSTREAM_REPOSITORY.git" "$env:SOURCE_DIR"
+          git -C "$env:SOURCE_DIR" checkout --quiet --detach '${{ needs.check.outputs.commit }}'
 
-          $head = (git -C source rev-parse HEAD).Trim()
+          $head = (git -C "$env:SOURCE_DIR" rev-parse HEAD).Trim()
           if ($head -ne '${{ needs.check.outputs.commit }}') { throw "checkout mismatch: $head" }
-          Write-Host "checked out $head"
+          Write-Host "checked out $head into $env:SOURCE_DIR"
 
       # ------------------------------------------------------------------
       # 2. 写入桌面端打包所需的发布设置
@@ -163,30 +184,30 @@ jobs:
             'DSH_DESKTOP_AUTO_UPDATE_ENV=production',
             "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=$policyOrigin"
           )
-          Set-Content -Path source/apps/desktop/.env.windows -Value $settings -Encoding utf8
-          Get-Content -Path source/apps/desktop/.env.windows | ForEach-Object { Write-Host $_ }
+          Set-Content -Path "$env:SOURCE_DIR/apps/desktop/.env.windows" -Value $settings -Encoding utf8
+          Get-Content -Path "$env:SOURCE_DIR/apps/desktop/.env.windows" | ForEach-Object { Write-Host $_ }
 
       # ------------------------------------------------------------------
       # 3. 使用官方仓库声明的工具链版本安装依赖并打包
       # ------------------------------------------------------------------
       - uses: pnpm/action-setup@v4
         with:
-          package_json_file: source/package.json
+          package_json_file: ${{ env.SOURCE_DIR }}/package.json
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
 
       - name: Install dependencies
-        working-directory: source
+        working-directory: ${{ env.SOURCE_DIR }}
         run: pnpm install --frozen-lockfile
 
       - name: Package Windows installer (unsigned)
         id: package
-        working-directory: source
+        working-directory: ${{ env.SOURCE_DIR }}
         shell: pwsh
-        # 官方命令原样执行。打包末尾会跑冒烟检查（含 LibreOffice 文档转换），
-        # 该检查在 GitHub 托管 runner 上失败；此处保留真实退出码，由下一步判定。
+        # 官方命令原样执行。打包末尾会跑冒烟检查（含 Office 文档转换），短路径下应完整通过；
+        # 此处保留真实退出码，由下一步判定。
         continue-on-error: true
         env:
           # 记录构建来源提交，使安装包内的构建元数据可回溯到官方源码。
@@ -208,12 +229,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $outcome = '${{ steps.package.outcome }}'
           $log = Join-Path $env:GITHUB_WORKSPACE 'packaging.log'
-          $directory = 'source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $directory = "$env:SOURCE_DIR/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts"
           $note = ''
 
           if ($outcome -ne 'success') {
             $text = if (Test-Path -LiteralPath $log) { Get-Content -Raw -LiteralPath $log } else { '' }
-            # 只容忍这一处已知失败（GitHub 托管 runner 上 LibreOffice 原生转换异常）；
+            # 只容忍这一处已知失败（LibreOffice 引擎因路径长度超出 Windows 上限而无法引导）；
             # 除此之外的任何失败仍然让构建失败。
             if ($text -notmatch 'desktop runtime: docx conversion failed') {
               throw 'packaging failed for a reason other than the Office smoke check; see the packaging log artifact'
@@ -222,7 +243,7 @@ jobs:
             if ($exe.Count -ne 1) {
               throw "the Office smoke check failed and no installer was produced in $directory"
             }
-            $note = '打包末尾的 Office 文档转换冒烟检查在 GitHub 托管 runner 上失败（LibreOfficeKit 原生转换异常）；安装程序已正常产出，其余运行时检查均通过。'
+            $note = "打包末尾的 Office 文档转换冒烟检查失败（LibreOfficeKit 原生转换异常，源码路径 $env:SOURCE_DIR）；安装程序已正常产出，其余运行时检查均通过。"
             Write-Warning $note
             Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value "> [!NOTE]`n> $note"
           }
@@ -237,7 +258,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $directory = 'source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $directory = "$env:SOURCE_DIR/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts"
           $exe = @(Get-ChildItem -LiteralPath $directory -Filter '*.exe' -File)
           if ($exe.Count -ne 1) {
             throw "expected exactly one installer in $directory, found $($exe.Count)"
@@ -250,6 +271,8 @@ jobs:
 
           Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value @(
             "file=$name",
+            # 正斜杠形式，供后面 bash 步骤直接使用，不受 Git Bash 路径改写影响。
+            "path=$($exe[0].FullName.Replace('\', '/'))",
             "sha256=$hash"
           )
           Write-Host "$name`nsha256: $hash"
@@ -266,7 +289,7 @@ jobs:
         with:
           name: dsh-desktop-win-x64-unsigned-${{ needs.check.outputs.version }}
           path: |
-            source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            ${{ env.SOURCE_DIR }}/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
             SHA256SUMS.txt
             packaging.log
           if-no-files-found: error
@@ -338,7 +361,6 @@ jobs:
           if [ '${{ needs.check.outputs.prerelease }}' = 'true' ]; then
             args+=(--prerelease)
           fi
-          args+=("source/apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/${{ steps.collect.outputs.file }}"
-            SHA256SUMS.txt)
+          args+=("${{ steps.collect.outputs.path }}" SHA256SUMS.txt)
 
           gh "${args[@]}"
