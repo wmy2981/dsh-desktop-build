@@ -162,6 +162,58 @@ jobs:
           if (Test-Path cli.pdf) { Write-Host "cli.pdf $((Get-Item cli.pdf).Length) bytes" } else { Write-Host 'cli.pdf 未生成' }
           exit 0
 
+      - name: Run the engine helper with controlled program directories
+        working-directory: probe
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ErrorActionPreference = 'Continue'
+
+          $package = (Resolve-Path 'node_modules/@deepseek-ai/libreoffice-kit-win32-x64').Path
+          $inputPath = (Resolve-Path 'input.docx').Path
+
+          function Invoke-EngineHelper([string]$label, [string]$helper, [string]$programDirectory) {
+            $scratch = Join-Path $env:TEMP ('lo-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            $profile = Join-Path $scratch 'profile'
+            New-Item -ItemType Directory -Force -Path $profile | Out-Null
+            $output = Join-Path $scratch 'out.pdf'
+
+            # kit 的 nativeEnvironment() 会把 HOME/USERPROFILE/TMP* 全部指向私有 profile 目录。
+            $saved = @{}
+            foreach ($name in 'HOME', 'USERPROFILE', 'TMPDIR', 'TMP', 'TEMP') {
+              $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+              [Environment]::SetEnvironmentVariable($name, $profile)
+            }
+            Write-Host "--- $label ---"
+            Write-Host "helper path length = $($helper.Length)"
+            Write-Host "program dir length = $($programDirectory.Length)"
+            $arguments = @(
+              '--program-directory', $programDirectory, '--input-path', $inputPath, '--output-path', $output,
+              '--profile-directory', $profile, '--max-output-bytes', '104857600',
+              '--max-image-resolution', '192', '--format', 'pdf', '--recalculate', 'false'
+            )
+            $result = (& $helper @arguments 2>&1 | Out-String).Trim()
+            Write-Host "helper said: $result"
+            Write-Host "exit=$LASTEXITCODE  pdf produced=$(Test-Path $output)"
+
+            foreach ($name in $saved.Keys) {
+              [Environment]::SetEnvironmentVariable($name, $saved[$name])
+            }
+            Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
+          }
+
+          Invoke-EngineHelper 'A: 真实 program 目录（对照）' (Join-Path $package 'bin/libreoffice-kit.exe') (Join-Path $package 'program')
+          Invoke-EngineHelper 'B: 不存在的 program 目录（模拟 app.asar 内部路径）' (Join-Path $package 'bin/libreoffice-kit.exe') (Join-Path $env:TEMP 'no-such-program-directory')
+
+          # C: 把整包复制到约 230 字符深的路径下再跑一次，检验 MAX_PATH 影响。
+          $padding = 'x' * 100
+          $deepPackage = Join-Path $env:TEMP "deep-$padding/app.asar/dsh/node_modules/@deepseek-ai/libreoffice-kit-win32-x64"
+          New-Item -ItemType Directory -Force -Path (Split-Path $deepPackage) | Out-Null
+          Copy-Item -Recurse -Force $package $deepPackage
+          Invoke-EngineHelper 'C: 约 230 字符深路径下的同一份引擎' (Join-Path $deepPackage 'bin/libreoffice-kit.exe') (Join-Path $deepPackage 'program')
+          Remove-Item -Recurse -Force (Join-Path $env:TEMP "deep-$padding") -ErrorAction SilentlyContinue
+          exit 0
+
       - name: Summary
         if: always()
         shell: pwsh
