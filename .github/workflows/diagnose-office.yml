@@ -192,6 +192,8 @@ jobs:
               '--profile-directory', $profile, '--max-output-bytes', '104857600',
               '--max-image-resolution', '192', '--format', 'pdf', '--recalculate', 'false'
             )
+            # kit 的 runNative 还会把解析出的字体逐个通过 --font-file 传给引擎。
+            if (Test-Path $fontFile) { $arguments += @('--font-file', $fontFile) }
             $result = (& $helper @arguments 2>&1 | Out-String).Trim()
             Write-Host "helper said: $result"
             Write-Host "exit=$LASTEXITCODE  pdf produced=$(Test-Path $output)"
@@ -202,16 +204,25 @@ jobs:
             Remove-Item -Recurse -Force $scratch -ErrorAction SilentlyContinue
           }
 
-          Invoke-EngineHelper 'A: 真实 program 目录（对照）' (Join-Path $package 'bin/libreoffice-kit.exe') (Join-Path $package 'program')
-          Invoke-EngineHelper 'B: 不存在的 program 目录（模拟 app.asar 内部路径）' (Join-Path $package 'bin/libreoffice-kit.exe') (Join-Path $env:TEMP 'no-such-program-directory')
+          # programDirectory 取自包的 prebuilds.json：program/program（不是 program）。
+          $relativeProgram = 'program/program'
+          $fontFile = Join-Path $env:WINDIR 'Fonts/arial.ttf'
 
-          # C: 把整包复制到约 230 字符深的路径下再跑一次，检验 MAX_PATH 影响。
-          $padding = 'x' * 100
-          $deepPackage = Join-Path $env:TEMP "deep-$padding/app.asar/dsh/node_modules/@deepseek-ai/libreoffice-kit-win32-x64"
+          Invoke-EngineHelper 'A: 短路径 + 正确 program 目录（对照）' (Join-Path $package 'bin/libreoffice-kit.exe') (Join-Path $package $relativeProgram)
+
+          # B: 复刻 CI 打包后的路径深度：包根约 207 字符（app.asar.unpacked 布局）。
+          $layoutTail = 'app.asar.unpacked/dsh/node_modules/@deepseek-ai/libreoffice-kit-win32-x64'
+          $prefix = Join-Path $env:TEMP 'deep'
+          $paddingLength = 207 - $prefix.Length - 1 - $layoutTail.Length
+          $deepPackage = Join-Path (Join-Path $prefix ('p' * $paddingLength)) $layoutTail
           New-Item -ItemType Directory -Force -Path (Split-Path $deepPackage) | Out-Null
           Copy-Item -Recurse -Force $package $deepPackage
-          Invoke-EngineHelper 'C: 约 230 字符深路径下的同一份引擎' (Join-Path $deepPackage 'bin/libreoffice-kit.exe') (Join-Path $deepPackage 'program')
-          Remove-Item -Recurse -Force (Join-Path $env:TEMP "deep-$padding") -ErrorAction SilentlyContinue
+          Write-Host "deep package root length = $($deepPackage.Length)"
+          $longest = Get-ChildItem $deepPackage -Recurse -File |
+            Sort-Object { $_.FullName.Length } -Descending | Select-Object -First 1
+          Write-Host "deep 包内最长文件路径 = $($longest.FullName.Length) 字符"
+          Invoke-EngineHelper 'B: 207 字符深路径 + 同一份引擎' (Join-Path $deepPackage 'bin/libreoffice-kit.exe') (Join-Path $deepPackage $relativeProgram)
+          Remove-Item -Recurse -Force (Split-Path (Split-Path $deepPackage)) -ErrorAction SilentlyContinue
           exit 0
 
       - name: Summary
