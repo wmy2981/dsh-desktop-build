@@ -329,6 +329,10 @@ jobs:
           Set-Content -Path release-notes.md -Value $lines -Encoding utf8
 
           $official = @(gh api "repos/$env:UPSTREAM_REPOSITORY/releases/tags/${{ needs.check.outputs.tag }}" --jq '.body')
+          # 官方说明里的 @用户名 会指名到真实账号并触发提及通知；
+          # 在 @ 后插入零宽空格后链接不再成立，渲染出来仍是被提及用户名的样子。
+          $zeroWidthSpace = [char]0x200B
+          $official = $official -replace '@', "@$zeroWidthSpace"
           Add-Content -Path release-notes.md -Value $official -Encoding utf8
           Add-Content -Path release-notes.md -Encoding utf8 -Value @('', '</details>')
 
